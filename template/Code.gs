@@ -167,9 +167,10 @@ function syncFromSource(source) {
   }
 
   // --- ソース読込 ---
-  let items = source.filterWorkspaceStyle
+  const { items: loadedItems, loadErrors } = source.filterWorkspaceStyle
     ? loadViaAdvancedApi(source, startRange, endRange)
     : loadViaCalendarApp(source, startRange, endRange);
+  let items = loadedItems;
 
   // ★普遍マーカー除外: 本システム生成物を全経路・全モード共通で除外（passesWorkspaceFilter より前段）
   items = items.filter(it => !(it.description || '').includes(GLOBAL_SYNC_MARKER));
@@ -185,6 +186,7 @@ function syncFromSource(source) {
   // --- (1) セカンダリ reconcile（フル詳細・非公開） ---
   const r1 = reconcileTarget(secondaryCal, items, {
     tag: secondaryTag, mode: MODE_FULL, color: source.color, startRange, endRange,
+    skipOrphanDelete: loadErrors > 0,
   });
   logReconcile(source.key, 'secondary', legacyDeleted, r1);
   if (r1.stopped) return;
@@ -194,6 +196,7 @@ function syncFromSource(source) {
     const primaryCal = CalendarApp.getDefaultCalendar();
     const r2 = reconcileTarget(primaryCal, items, {
       tag: primaryTag, mode: MODE_PLACEHOLDER, color: source.color, startRange, endRange,
+      skipOrphanDelete: loadErrors > 0,
     });
     logReconcile(source.key, 'primary', 0, r2);
   }
@@ -219,10 +222,11 @@ function runSelfMirror() {
     return;
   }
 
-  let items = loadViaAdvancedApi(
+  const { items: loadedItems, loadErrors } = loadViaAdvancedApi(
     { key: 'self', calendarIds: SELF_MIRROR.sourceCalendarIds },
     startRange, endRange
   );
+  let items = loadedItems;
 
   // 自分のプライマリ上のブロック層（[calsync: 入り）はミラーしない
   items = items.filter(it => !(it.description || '').includes(GLOBAL_SYNC_MARKER));
@@ -233,6 +237,7 @@ function runSelfMirror() {
 
   const r = reconcileTarget(relayCal, items, {
     tag: relayTag, mode: MODE_RELAY, color: CalendarApp.EventColor.GRAY, startRange, endRange,
+    skipOrphanDelete: loadErrors > 0,
   });
   logReconcile('self', 'relay', legacyDeleted, r);
 }
@@ -241,7 +246,8 @@ function logReconcile(key, layer, legacyDeleted, r) {
   console.log(
     `[${key}/${layer}] legacyDeleted=${legacyDeleted}, created=${r.created}, updated=${r.updated}, ` +
     `deleted=${r.deleted}, dupDeleted=${r.dupDeleted}, skipped=${r.skipped}, ops=${opCount}` +
-    (r.stopped ? ' (deferred to next run)' : '')
+    (r.stopped ? ' (deferred to next run)' : '') +
+    (r.orphanSkipped ? ' (orphan deletion skipped: source load errors)' : '')
   );
 }
 
@@ -250,7 +256,7 @@ function logReconcile(key, layer, legacyDeleted, r) {
  * mode で書き込み挙動（フル詳細・非公開 or プレースホルダー・非公開なし）を切り替える。
  */
 function reconcileTarget(targetCal, items, opts) {
-  const { tag, mode, color, startRange, endRange } = opts;
+  const { tag, mode, color, startRange, endRange, skipOrphanDelete } = opts;
 
   const targetEvents = targetCal.getEvents(startRange, endRange);
   const synced = new Map();
@@ -267,46 +273,59 @@ function reconcileTarget(targetCal, items, opts) {
     else synced.set(srcId, t);
   }
 
-  const seen = new Set();
-  let created = 0, updated = 0, deleted = 0, dupDeleted = 0, skipped = 0, stopped = false;
+  const sourceIds = new Set(items.map(it => it.id));
+  let created = 0, updated = 0, deleted = 0, dupDeleted = 0, skipped = 0, stopped = false, orphanSkipped = false;
 
-  for (const it of items) {
-    if (stopped) break;
-    seen.add(it.id);
-    const desc = mode.descriptionOf(it.description, it.id, tag);
-    const existing = synced.get(it.id);
-    if (existing) {
-      if (!needsUpdate(existing, it, mode, tag)) { skipped++; continue; }
-      const r = performOp(() => updateEvent(existing, it, desc, color, mode, targetCal));
-      if (r === 'ok') updated++;
-      else { stopped = true; break; }
-    } else {
-      const r = performOp(() => writeEvent(targetCal, it, desc, color, mode));
-      if (r === 'ok') created++;
-      else { stopped = true; break; }
-    }
-  }
+  // 削除（重複・孤立）を作成より先に処理する。初回大量同期などで作成バジェットが
+  // 尽きても、実態に合わなくなった予定（除外条件の変更・元予定の削除等）が
+  // 最優先でカレンダーから消えるようにするため。
 
   // 重複target（同じ source_id を持つ余分なtarget）を削除
-  if (!stopped) {
-    for (const t of dups) {
-      const r = performOp(() => t.deleteEvent());
-      if (r === 'ok') dupDeleted++;
-      else { stopped = true; break; }
-    }
+  for (const t of dups) {
+    if (stopped) break;
+    const r = performOp(() => t.deleteEvent());
+    if (r === 'ok') dupDeleted++;
+    else stopped = true;
   }
 
   // 孤立target（source 側に存在しない source_id）を削除
   if (!stopped) {
-    for (const [srcId, tgt] of synced.entries()) {
-      if (seen.has(srcId)) continue;
-      const r = performOp(() => tgt.deleteEvent());
-      if (r === 'ok') deleted++;
-      else { stopped = true; break; }
+    if (skipOrphanDelete) {
+      // ソースの読み込みに失敗した実行では孤立削除をしない。読み込み失敗時は
+      // 予定が「存在しないように見える」だけであり、削除を先行させる設計では
+      // 一時的な読み込み障害が正しい同期予定の大量誤削除に直結するため。
+      orphanSkipped = true;
+    } else {
+      for (const [srcId, tgt] of synced.entries()) {
+        if (stopped) break;
+        if (sourceIds.has(srcId)) continue;
+        const r = performOp(() => tgt.deleteEvent());
+        if (r === 'ok') deleted++;
+        else stopped = true;
+      }
     }
   }
 
-  return { created, updated, deleted, dupDeleted, skipped, stopped };
+  // 作成/更新
+  if (!stopped) {
+    for (const it of items) {
+      if (stopped) break;
+      const desc = mode.descriptionOf(it.description, it.id, tag);
+      const existing = synced.get(it.id);
+      if (existing) {
+        if (!needsUpdate(existing, it, mode, tag)) { skipped++; continue; }
+        const r = performOp(() => updateEvent(existing, it, desc, color, mode, targetCal));
+        if (r === 'ok') updated++;
+        else stopped = true;
+      } else {
+        const r = performOp(() => writeEvent(targetCal, it, desc, color, mode));
+        if (r === 'ok') created++;
+        else stopped = true;
+      }
+    }
+  }
+
+  return { created, updated, deleted, dupDeleted, skipped, stopped, orphanSkipped };
 }
 
 // mode に応じて「更新が必要か」を判定
@@ -367,6 +386,7 @@ function passesWorkspaceFilter(it, selfEmail) {
 // Calendar Advanced Service 経由で取得（eventType/attendees が必要な業務アカウント向け）
 function loadViaAdvancedApi(source, startRange, endRange) {
   const items = [];
+  let loadErrors = 0;
   for (const calId of source.calendarIds) {
     try {
       const response = Calendar.Events.list(calId, {
@@ -394,19 +414,22 @@ function loadViaAdvancedApi(source, startRange, endRange) {
       }
     } catch (e) {
       console.warn(`[${source.key}] cannot access ${calId}: ${e.message}`);
+      loadErrors++;
     }
   }
-  return items;
+  return { items, loadErrors };
 }
 
 // CalendarApp 経由で取得（個人アカウント向け、フィルタ不要なソース用）
 function loadViaCalendarApp(source, startRange, endRange) {
   const items = [];
+  let loadErrors = 0;
   for (const calId of source.calendarIds) {
     try {
       const cal = CalendarApp.getCalendarById(calId);
       if (!cal) {
         console.warn(`[${source.key}] cannot access ${calId}`);
+        loadErrors++;
         continue;
       }
       const events = cal.getEvents(startRange, endRange);
@@ -425,9 +448,10 @@ function loadViaCalendarApp(source, startRange, endRange) {
       }
     } catch (e) {
       console.warn(`[${source.key}] cannot access ${calId}: ${e.message}`);
+      loadErrors++;
     }
   }
-  return items;
+  return { items, loadErrors };
 }
 
 function parseApiTimes(apiEvent, isAllDay) {
