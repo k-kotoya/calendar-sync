@@ -70,6 +70,24 @@ const SOURCES = [
   },
 ];
 
+// 中継（リレー）モード: このアカウント自身のプライマリの外部共有が、
+// 管理者設定などで「予定あり（時間枠のみ）」に制限された場合のみ設定する。
+// 制限されると他アカウントはタイトル・説明を読めなくなる（すべてnullでマスクされる）ため、
+// 自分のプライマリをセカンダリの中継カレンダーへミラーし、他アカウントにはそちらを読ませる。
+// 詳細手順は README.md の「プライマリの外部共有が制限された場合（中継モード）」を参照。
+//
+// 設定例（コメントアウト。制限されていなければ null のままでよい）:
+// const SELF_MIRROR = {
+//   sourceCalendarIds: ['primary'],
+//   relayCalendarName: '外部連携用（自動転記）',
+//   filterWorkspaceStyle: true,
+//   selfEmail: 'account-a@example.com',
+//   shareWith: ['account-b@example.com', 'account-c@example.com'],
+//   tagVersion: 1,
+//   legacyTags: [],
+// };
+const SELF_MIRROR = null;
+
 // ==== COMMON ENGINE (keep identical across all account files) ====
 
 const EXCLUDED_TITLES = new Set(['移動', '予定あり']);
@@ -104,11 +122,25 @@ const MODE_PLACEHOLDER = {
   comparesContent: false,
 };
 
+// 中継（リレー）モード: 自分の予定を中継カレンダーへフル詳細でミラーする。
+// 中継カレンダーは他アカウントから「ソース」として読まれるため、非公開にしない。
+// タグは [calrelay: プレフィックス（[calsync: と別）なので、他アカウントの
+// GLOBAL_SYNC_MARKER 除外に引っかからず、ソースとして正しく読まれる。
+const MODE_RELAY = {
+  name: 'relay',
+  visibility: CalendarApp.Visibility.DEFAULT,
+  titleOf: function (it) { return it.title; },
+  locationOf: function (it) { return it.location; },
+  descriptionOf: function (srcDesc, srcId, tag) { return buildDescription(srcDesc, srcId, tag); },
+  comparesContent: true,
+};
+
 let opCount = 0;
 
 // === エントリポイント ===
 function syncCalendar() {
   opCount = 0;
+  runSelfMirror();
   for (const source of SOURCES) {
     if (opCount >= MAX_OPERATIONS_PER_RUN) {
       console.log(`[sync] budget reached before source=${source.key}, deferring to next run`);
@@ -167,6 +199,44 @@ function syncFromSource(source) {
   }
 }
 
+// 自分の予定を中継カレンダーへミラーする（SELF_MIRROR = null なら何もしない）。
+// 管理者設定でプライマリの外部共有が「予定あり」のみに制限されると、他アカウントは
+// プライマリの詳細を読めなくなる（タイトル・説明がすべてnullでマスクされる）。
+// セカンダリカレンダーの外部共有ポリシーは別設定のため、中継用セカンダリに
+// 自分自身でミラーし、他アカウントにはそちらをソースとして読ませる。
+function runSelfMirror() {
+  if (!SELF_MIRROR) return;
+  const now = new Date();
+  const startRange = new Date(now.getTime() - PAST_DAYS * 24 * 60 * 60 * 1000);
+  const endRange = new Date(now.getTime() + FUTURE_DAYS * 24 * 60 * 60 * 1000);
+
+  const relayTag = `[calrelay:self-v${SELF_MIRROR.tagVersion}]`;
+  const relayCal = getOrCreateCalendar(SELF_MIRROR.relayCalendarName);
+
+  const legacyDeleted = cleanupLegacy(relayCal, startRange, endRange, relayTag, SELF_MIRROR.legacyTags || []);
+  if (opCount >= MAX_OPERATIONS_PER_RUN) {
+    console.log(`[self/relay] legacy cleanup deferred more work to next run. deletedThisRun=${legacyDeleted}`);
+    return;
+  }
+
+  let items = loadViaAdvancedApi(
+    { key: 'self', calendarIds: SELF_MIRROR.sourceCalendarIds },
+    startRange, endRange
+  );
+
+  // 自分のプライマリ上のブロック層（[calsync: 入り）はミラーしない
+  items = items.filter(it => !(it.description || '').includes(GLOBAL_SYNC_MARKER));
+  items.sort((a, b) => a.start.getTime() - b.start.getTime());
+  if (SELF_MIRROR.filterWorkspaceStyle) {
+    items = items.filter(it => passesWorkspaceFilter(it, SELF_MIRROR.selfEmail));
+  }
+
+  const r = reconcileTarget(relayCal, items, {
+    tag: relayTag, mode: MODE_RELAY, color: CalendarApp.EventColor.GRAY, startRange, endRange,
+  });
+  logReconcile('self', 'relay', legacyDeleted, r);
+}
+
 function logReconcile(key, layer, legacyDeleted, r) {
   console.log(
     `[${key}/${layer}] legacyDeleted=${legacyDeleted}, created=${r.created}, updated=${r.updated}, ` +
@@ -188,10 +258,13 @@ function reconcileTarget(targetCal, items, opts) {
   for (const t of targetEvents) {
     const desc = t.getDescription() || '';
     if (!desc.includes(tag)) continue;
-    const m = desc.match(/source_id:(\S+)/);
-    if (!m) continue;
-    if (synced.has(m[1])) dups.push(t);
-    else synced.set(m[1], t);
+    // 中継予定を転記すると description に source_id タグが多段に積まれるため、
+    // 自分が付けた「最後の」source_id を正とする（自タグは常に末尾に追記される）
+    const ms = desc.match(/source_id:(\S+)/g);
+    if (!ms) continue;
+    const srcId = ms[ms.length - 1].substring('source_id:'.length);
+    if (synced.has(srcId)) dups.push(t);
+    else synced.set(srcId, t);
   }
 
   const seen = new Set();
@@ -455,6 +528,26 @@ function purgeSyncedEvents() {
     }
     console.log(`[${source.key}] purged ${n} events`);
   }
+
+  // 中継カレンダーの掃除（SELF_MIRROR 設定時のみ）
+  if (SELF_MIRROR) {
+    const relayTag = `[calrelay:self-v${SELF_MIRROR.tagVersion}]`;
+    const allTags = [relayTag].concat(SELF_MIRROR.legacyTags || []);
+    const relayCal = getOrCreateCalendar(SELF_MIRROR.relayCalendarName);
+    const now = new Date();
+    const start = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
+    const end = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000);
+    const events = relayCal.getEvents(start, end);
+    let n = 0;
+    for (const e of events) {
+      const desc = e.getDescription() || '';
+      if (!containsAny(desc, allTags)) continue;
+      const r = performOp(() => e.deleteEvent());
+      if (r === 'ok') n++;
+      else break;
+    }
+    console.log(`[self/relay] purged ${n} events`);
+  }
 }
 
 // 緊急一括削除用: プライマリ＋専用カレンダーの両方から、期間・件数上限なしで
@@ -489,6 +582,52 @@ function purgeAllHistory() {
     }
     console.log(`[${source.key}] purgeAllHistory: deleted ${total} events total`);
   }
+
+  // 中継カレンダーの掃除（SELF_MIRROR 設定時のみ）
+  if (SELF_MIRROR) {
+    const relayTag = `[calrelay:self-v${SELF_MIRROR.tagVersion}]`;
+    const allTags = [relayTag].concat(SELF_MIRROR.legacyTags || []);
+    const relayCal = getOrCreateCalendar(SELF_MIRROR.relayCalendarName);
+    const start = new Date(Date.now() - 3 * 365 * 24 * 60 * 60 * 1000); // 過去3年
+    const end = new Date(Date.now() + 3 * 365 * 24 * 60 * 60 * 1000);   // 未来3年
+    const events = relayCal.getEvents(start, end);
+    let total = 0;
+    for (const e of events) {
+      const desc = e.getDescription() || '';
+      if (!containsAny(desc, allTags)) continue;
+      try {
+        e.deleteEvent();
+        total++;
+        Utilities.sleep(SLEEP_MS_BETWEEN_OPS);
+      } catch (err) {
+        console.warn(`delete failed, stopping: ${err.message}`);
+        console.log(`[self/relay] purgeAllHistory: deleted ${total} events so far (stopped early)`);
+        return;
+      }
+    }
+    console.log(`[self/relay] purgeAllHistory: deleted ${total} events total`);
+  }
+}
+
+// 一度だけ手動実行: 中継カレンダーを作成し、SELF_MIRROR.shareWith の各アカウントへ
+// 「すべての予定の詳細」(reader) で共有し、カレンダーIDをログに出す。
+// 他アカウントの SOURCES の calendarIds には、ここでログに出た ID を設定する。
+function setupRelaySharing() {
+  if (!SELF_MIRROR) {
+    console.log('SELF_MIRROR が設定されていません');
+    return;
+  }
+  const relayCal = getOrCreateCalendar(SELF_MIRROR.relayCalendarName);
+  const calId = relayCal.getId();
+  for (const email of (SELF_MIRROR.shareWith || [])) {
+    try {
+      Calendar.Acl.insert({ role: 'reader', scope: { type: 'user', value: email } }, calId);
+      console.log(`shared "${SELF_MIRROR.relayCalendarName}" to ${email} (reader)`);
+    } catch (e) {
+      console.warn(`ACL insert failed for ${email}: ${e.message}`);
+    }
+  }
+  console.log(`RELAY CALENDAR ID: ${calId}`);
 }
 
 function installTrigger() {
