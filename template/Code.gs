@@ -90,7 +90,9 @@ const SELF_MIRROR = null;
 
 // ==== COMMON ENGINE (keep identical across all account files) ====
 
-const EXCLUDED_TITLES = new Set(['移動', '予定あり']);
+// 転記しないタイトル（完全一致）。既定は空＝タイトルでは除外しない。
+// 本システムが書く「予定あり」ブロックは GLOBAL_SYNC_MARKER で除外されるため、ここに入れなくてもエコーしない
+const EXCLUDED_TITLES = new Set([]);
 const ALLOWED_EVENT_TYPES = new Set(['default', 'focusTime']);
 
 const PAST_DAYS = 0;
